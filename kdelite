@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+# KDElite - make KDE Plasma use less RAM.
+#
+#   kdelite apply [--aggressive] [--dry-run] [--no-stop]
+#   kdelite revert [--dry-run]
+#   kdelite status
+#
+# Every config file touched by `apply` is backed up first, so `revert`
+# puts things back exactly as they were.
+set -euo pipefail
+
+VERSION="0.1.0"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+STATE_DIR="$DATA_HOME/kdelite"
+
+DRY_RUN=0
+AGGRESSIVE=0
+STOP_PROCS=1
+
+# ---------------------------------------------------------------- output ----
+if [[ -t 1 ]]; then
+    C_B=$'\033[1;34m' C_G=$'\033[1;32m' C_Y=$'\033[1;33m' C_R=$'\033[1;31m' C_0=$'\033[0m'
+else
+    C_B="" C_G="" C_Y="" C_R="" C_0=""
+fi
+log()  { printf '%s==>%s %s\n' "$C_B" "$C_0" "$*"; }
+ok()   { printf '  %s✓%s %s\n' "$C_G" "$C_0" "$*"; }
+skip() { printf '  %s-%s %s\n' "$C_Y" "$C_0" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
+
+# Run a command, or just print it in dry-run mode. Failures are not fatal.
+run() {
+    if (( DRY_RUN )); then
+        printf '  [dry-run] %s\n' "$*"
+    else
+        "$@" >/dev/null 2>&1 || true
+    fi
+}
+
+# ------------------------------------------------------------ tool setup ----
+KWRITE="" KREAD="" KF=""
+detect_tools() {
+    local v
+    for v in 6 5; do
+        if command -v "kwriteconfig$v" >/dev/null 2>&1; then
+            KWRITE="kwriteconfig$v" KREAD="kreadconfig$v" KF="$v"
+            return
+        fi
+    done
+    if (( DRY_RUN )); then
+        KWRITE="kwriteconfig6" KREAD="kreadconfig6" KF="6"
+        warn "kwriteconfig not found; assuming Plasma 6 for the dry run"
+    else
+        die "kwriteconfig6/kwriteconfig5 not found. Is KDE Plasma installed?"
+    fi
+}
+
+balooctl_cmd() {
+    if command -v balooctl6 >/dev/null 2>&1; then echo balooctl6
+    elif command -v balooctl >/dev/null 2>&1; then echo balooctl
+    fi
+}
+
+# ---------------------------------------------------------------- backup ----
+BACKUP_DIR="" MANIFEST=""
+declare -A BACKED_UP=()
+
+start_backup() {
+    BACKUP_DIR="$STATE_DIR/backup-$(date +%Y%m%d-%H%M%S)"
+    MANIFEST="$BACKUP_DIR/manifest"
+    (( DRY_RUN )) && return
+    mkdir -p "$BACKUP_DIR"
+    : > "$MANIFEST"
+}
+
+record() { (( DRY_RUN )) || printf '%s\n' "$*" >> "$MANIFEST"; }
+
+# backup_file <path relative to $CONFIG_HOME>
+backup_file() {
+    local rel="$1"
+    [[ -n "${BACKED_UP[$rel]:-}" ]] && return
+    BACKED_UP[$rel]=1
+    (( DRY_RUN )) && return
+    if [[ -e "$CONFIG_HOME/$rel" ]]; then
+        mkdir -p "$BACKUP_DIR/files/$(dirname "$rel")"
+        cp -a "$CONFIG_HOME/$rel" "$BACKUP_DIR/files/$rel"
+        record "file	$rel	present"
+    else
+        record "file	$rel	absent"
+    fi
+}
+
+# --------------------------------------------------------------- helpers ----
+# cfg <file> <group> <key> <value>
+cfg() {
+    local file="$1" group="$2" key="$3" value="$4"
+    backup_file "$file"
+    if (( DRY_RUN )); then
+        printf '  [dry-run] %s: [%s] %s=%s\n' "$file" "$group" "$key" "$value"
+    else
+        "$KWRITE" --file "$CONFIG_HOME/$file" --group "$group" --key "$key" "$value"
+    fi
+}
+
+kded_rc() { echo "kded${KF}rc"; }
+
+disable_kded_module() {
+    cfg "$(kded_rc)" "Module-$1" autoload false
+}
+
+# Hide a system autostart entry by dropping a Hidden=true override into
+# ~/.config/autostart (standard XDG behaviour, also honoured by the
+# systemd autostart generator Plasma 6 uses).
+hide_autostart() {
+    local name="$1" dir found="" IFS=':'
+    for dir in ${XDG_CONFIG_DIRS:-/etc/xdg} /usr/share; do
+        [[ -e "$dir/autostart/$name" ]] && { found=1; break; }
+    done
+    unset IFS
+    if [[ -z "$found" && ! -e "$CONFIG_HOME/autostart/$name" ]]; then
+        skip "autostart $name (not installed)"
+        return
+    fi
+    backup_file "autostart/$name"
+    if (( DRY_RUN )); then
+        printf '  [dry-run] hide autostart %s\n' "$name"
+        return
+    fi
+    mkdir -p "$CONFIG_HOME/autostart"
+    if [[ -e "$CONFIG_HOME/autostart/$name" ]]; then
+        "$KWRITE" --file "$CONFIG_HOME/autostart/$name" --group "Desktop Entry" --key Hidden true
+    else
+        printf '[Desktop Entry]\nType=Application\nName=%s (disabled by KDElite)\nHidden=true\n' \
+            "${name%.desktop}" > "$CONFIG_HOME/autostart/$name"
+    fi
+    ok "autostart $name hidden"
+}
+
+mask_user_unit() {
+    local unit="$1"
+    if ! command -v systemctl >/dev/null 2>&1 \
+        || ! systemctl --user cat "$unit" >/dev/null 2>&1; then
+        skip "unit $unit (not present)"
+        return
+    fi
+    if [[ "$(systemctl --user is-enabled "$unit" 2>/dev/null || true)" == masked ]]; then
+        skip "unit $unit (already masked)"
+        return
+    fi
+    run systemctl --user mask --now "$unit"
+    record "unit	$unit"
+    (( DRY_RUN )) || ok "unit $unit masked"
+}
+
+stop_proc() {
+    (( STOP_PROCS )) || return 0
+    local name="$1"
+    if pgrep -u "$(id -u)" -x "$name" >/dev/null 2>&1; then
+        run pkill -u "$(id -u)" -x "$name"
+        (( DRY_RUN )) || ok "stopped $name"
+    fi
+}
+
+# ----------------------------------------------------------------- lists ----
+# KWin effects. Plasma 5 used a kwin4_effect_ prefix for some; we set both.
+KWIN_EFFECTS=(
+    blur contrast slidingpopups fadingpopups scale squash magiclamp
+    wobblywindows maximize dimscreen login logout fullscreen
+    windowaperture sheet slide dialogparent fadedesktop frozenapp
+    translucency morphingpopups startupfeedback
+)
+
+# Background daemons (kded modules) that are rarely needed.
+KDED_DEFAULT=(
+    browserintegrationreminder remotenotifier smbwatcher kded_accounts
+    donationmessage baloosearchmodule kameleon
+)
+# Turned off only with --aggressive: these remove real features.
+KDED_AGGRESSIVE=(
+    bluedevil printmanager wacomtablet freespacenotifier
+    plasma_accentcolor_service geotimezoned devicenotifications
+)
+
+AUTOSTART_DEFAULT=(
+    org.kde.discover.notifier.desktop
+    org.kde.kdeconnect.daemon.desktop
+    org.kde.plasma-welcome.desktop
+    org.kde.kalendarac.desktop
+    baloo_file.desktop
+)
+AUTOSTART_AGGRESSIVE=(
+    kaccess.desktop
+    xembedsniproxy.desktop
+    gmenudbusmenuproxy.desktop
+)
+UNITS_AGGRESSIVE=(
+    plasma-xembedsniproxy.service
+    plasma-gmenudbusmenuproxy.service
+)
+
+# KRunner plugins that load big databases into memory.
+KRUNNER_OFF=(
+    baloosearch krunner_appstream browsertabs browserhistory
+)
+
+# ----------------------------------------------------------------- apply ----
+cmd_apply() {
+    detect_tools
+    start_backup
+    log "KDElite $VERSION: applying low-RAM profile (Plasma $KF$( (( AGGRESSIVE )) && echo ', aggressive'))"
+    (( DRY_RUN )) && log "Dry run: nothing will be changed"
+
+    log "File indexer (Baloo)"
+    local bctl; bctl="$(balooctl_cmd)"
+    if [[ -n "$bctl" ]] && (( ! DRY_RUN )) && [[ "$("$KREAD" --file "$CONFIG_HOME/baloofilerc" \
+            --group "Basic Settings" --key Indexing-Enabled --default true 2>/dev/null)" == true ]]; then
+        record "baloo	enabled"
+    fi
+    cfg baloofilerc "Basic Settings" "Indexing-Enabled" false
+    if [[ -n "$bctl" ]]; then
+        run "$bctl" suspend
+        run "$bctl" disable
+    fi
+    stop_proc baloo_file
+    stop_proc baloo_file_extractor
+
+    log "PIM backend (Akonadi)"
+    if command -v akonadictl >/dev/null 2>&1; then
+        run akonadictl stop
+        (( DRY_RUN )) || ok "akonadi stopped (only restarts when you open a PIM app)"
+    else
+        skip "akonadi not installed"
+    fi
+
+    log "Desktop effects and animations"
+    local fx
+    for fx in "${KWIN_EFFECTS[@]}"; do
+        cfg kwinrc Plugins "${fx}Enabled" false
+        cfg kwinrc Plugins "kwin4_effect_${fx}Enabled" false
+    done
+    cfg kdeglobals KDE AnimationDurationFactor 0
+    cfg ksplashrc KSplash Engine none
+    cfg ksplashrc KSplash Theme None
+
+    log "Background services (kded modules)"
+    local m
+    for m in "${KDED_DEFAULT[@]}"; do disable_kded_module "$m"; done
+    if (( AGGRESSIVE )); then
+        for m in "${KDED_AGGRESSIVE[@]}"; do disable_kded_module "$m"; done
+    fi
+
+    log "Search plugins (KRunner / app launcher)"
+    local p
+    for p in "${KRUNNER_OFF[@]}"; do cfg krunnerrc Plugins "${p}Enabled" false; done
+
+    log "Autostart programs"
+    local a
+    for a in "${AUTOSTART_DEFAULT[@]}"; do hide_autostart "$a"; done
+    stop_proc kdeconnectd
+    stop_proc DiscoverNotifier
+    stop_proc kalendarac
+
+    if (( AGGRESSIVE )); then
+        log "Aggressive extras"
+        for a in "${AUTOSTART_AGGRESSIVE[@]}"; do hide_autostart "$a"; done
+        local u
+        for u in "${UNITS_AGGRESSIVE[@]}"; do mask_user_unit "$u"; done
+        # Stop tracking recently used files/apps.
+        cfg kactivitymanagerdrc Plugins org.kde.ActivityManager.ResourceScoringEnabled false
+        cfg kactivitymanagerd-pluginsrc Plugin-org.kde.ActivityManager.Resources.Scoring what-to-remember 2
+        # Start with an empty session instead of reopening every app.
+        cfg ksmserverrc General loginMode emptySession
+        # On X11 the compositor is optional; switching it off saves GPU memory.
+        if [[ "${XDG_SESSION_TYPE:-}" == x11 ]]; then
+            cfg kwinrc Compositing Enabled false
+        fi
+    fi
+
+    if (( ! DRY_RUN )); then
+        printf '%s\n' "$BACKUP_DIR" > "$STATE_DIR/last-backup"
+        if command -v dbus-send >/dev/null 2>&1; then
+            dbus-send --session --type=method_call --dest=org.kde.KWin /KWin \
+                org.kde.KWin.reconfigure >/dev/null 2>&1 || true
+        fi
+    fi
+
+    echo
+    log "Done."
+    if (( ! DRY_RUN )); then
+        echo "  Backup saved to: $BACKUP_DIR"
+        echo "  Log out and back in for every change to take effect."
+        echo "  Undo everything with: kdelite revert"
+    fi
+}
+
+# ---------------------------------------------------------------- revert ----
+cmd_revert() {
+    [[ -f "$STATE_DIR/last-backup" ]] || die "no KDElite backup found in $STATE_DIR"
+    local dir; dir="$(cat "$STATE_DIR/last-backup")"
+    [[ -f "$dir/manifest" ]] || die "backup manifest missing: $dir/manifest"
+    log "Restoring from $dir"
+
+    local kind a b
+    while IFS=$'\t' read -r kind a b; do
+        case "$kind" in
+            file)
+                if [[ "$b" == present ]]; then
+                    run mkdir -p "$(dirname "$CONFIG_HOME/$a")"
+                    run cp -a "$dir/files/$a" "$CONFIG_HOME/$a"
+                    (( DRY_RUN )) || ok "restored $a"
+                else
+                    run rm -f "$CONFIG_HOME/$a"
+                    (( DRY_RUN )) || ok "removed $a"
+                fi
+                ;;
+            unit)
+                run systemctl --user unmask "$a"
+                run systemctl --user start "$a"
+                (( DRY_RUN )) || ok "unmasked $a"
+                ;;
+            baloo)
+                local bctl; bctl="$(balooctl_cmd)"
+                [[ -n "$bctl" ]] && run "$bctl" enable
+                (( DRY_RUN )) || ok "file indexer re-enabled"
+                ;;
+        esac
+    done < "$dir/manifest"
+
+    if (( ! DRY_RUN )); then
+        mv "$STATE_DIR/last-backup" "$STATE_DIR/last-reverted"
+        dbus-send --session --type=method_call --dest=org.kde.KWin /KWin \
+            org.kde.KWin.reconfigure >/dev/null 2>&1 || true
+    fi
+    log "Reverted. Log out and back in to finish."
+}
+
+# ---------------------------------------------------------------- status ----
+KDE_PROC_RE='^(plasma|kwin|krunner|kded|ksmserver|kactivitymanage|baloo|akonadi|kdeconnect|Discover|xembedsniproxy|gmenudbusmenupr|kaccess|polkit-kde|org_kde_powerde|powerdevil|kglobalaccel|kwalletd|ksecretd|kscreen|Xwayland|kiod|kioworker|kalendarac|xdg-desktop-por|ksystemstats|startplasma|klauncher|kded|ksplash|mysqld|korgac|kmix|klipper)'
+
+cmd_status() {
+    local pid comm pss total=0 lines=""
+    for pid in /proc/[0-9]*; do
+        [[ -O "$pid" ]] || continue
+        comm="$(cat "$pid/comm" 2>/dev/null)" || continue
+        [[ "$comm" =~ $KDE_PROC_RE ]] || continue
+        pss="$(awk '/^Pss:/ {print $2; exit}' "$pid/smaps_rollup" 2>/dev/null)" || true
+        if [[ -z "$pss" ]]; then
+            pss="$(awk '/^VmRSS:/ {print $2; exit}' "$pid/status" 2>/dev/null)" || true
+        fi
+        [[ -n "$pss" ]] || continue
+        total=$(( total + pss ))
+        lines+="$pss $comm"$'\n'
+    done
+
+    log "KDE processes for $(id -un) (proportional memory, PSS)"
+    if [[ -z "$lines" ]]; then
+        echo "  No KDE processes running."
+    else
+        printf '%s' "$lines" | sort -rn | awk '{printf "  %8.1f MiB  %s\n", $1/1024, $2}'
+        printf '  %s--------%s\n' "$C_B" "$C_0"
+        printf '  %8.1f MiB  total\n' "$(awk -v t="$total" 'BEGIN{print t/1024}')"
+    fi
+    echo
+    if command -v free >/dev/null 2>&1; then
+        log "System memory"
+        free -h | sed 's/^/  /'
+    fi
+    echo
+    if [[ -f "$STATE_DIR/last-backup" ]]; then
+        echo "  KDElite profile: applied (backup: $(cat "$STATE_DIR/last-backup"))"
+    else
+        echo "  KDElite profile: not applied"
+    fi
+}
+
+# ------------------------------------------------------------------ main ----
+usage() {
+    cat <<EOF
+KDElite $VERSION - make KDE Plasma use less RAM
+
+Usage:
+  kdelite apply [--aggressive] [--dry-run] [--no-stop]
+  kdelite revert [--dry-run]
+  kdelite status
+
+Commands:
+  apply     Turn off memory-hungry Plasma features (backs up configs first)
+  revert    Restore the configs saved by the last 'apply'
+  status    Show how much RAM each KDE process is using
+
+Options:
+  --aggressive  Also turn off Bluetooth, printing, Wacom, accessibility,
+                legacy tray support, recent-files tracking and session restore
+  --dry-run     Show what would change without changing anything
+  --no-stop     Don't stop running processes; changes apply at next login
+EOF
+}
+
+main() {
+    local cmd="${1:-}"
+    [[ $# -gt 0 ]] && shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --aggressive) AGGRESSIVE=1 ;;
+            --dry-run|-n) DRY_RUN=1 ;;
+            --no-stop) STOP_PROCS=0 ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "unknown option: $1 (see --help)" ;;
+        esac
+        shift
+    done
+    [[ $EUID -eq 0 && "$cmd" != status && "$cmd" != "" ]] && \
+        warn "running as root changes root's settings, not yours. Run as your normal user."
+    case "$cmd" in
+        apply) cmd_apply ;;
+        revert) cmd_revert ;;
+        status) cmd_status ;;
+        -h|--help|help|"") usage ;;
+        --version|version) echo "$VERSION" ;;
+        *) die "unknown command: $cmd (see --help)" ;;
+    esac
+}
+
+main "$@"
